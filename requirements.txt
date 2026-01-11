@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+yfinance
+requests
+plotly
+scipy
+urllib3
+groq
