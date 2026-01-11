@@ -7,3 +7,4 @@ plotly
 scipy
 urllib3
 groq
+matplotlib
