@@ -234,7 +234,7 @@ def get_ai_summary(api_key, results_data):
     """
 
     completion = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "user",
