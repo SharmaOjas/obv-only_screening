@@ -8,11 +8,62 @@ from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
 import requests
 from io import StringIO
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+from io import StringIO
 import concurrent.futures
 import time
 import urllib3
+import warnings
 
+# -------------------------------------------------
+# Network & Session Configuration
+# -------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
+
+def get_session():
+    """Creates a requests Session with robust retry logic."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+def download_data_with_retry(tickers, period, retries=3):
+    """
+    Wraps yf.download with stronger retry logic for connection errors.
+    """
+    for attempt in range(retries):
+        try:
+            # yfinance doesn't natively accept a session for .download() in all versions,
+            # but we can try-except the call itself.
+            # Using threads=False to reduce rate-limit likelihood during retries if batching
+            data = yf.download(
+                tickers, 
+                period=period, 
+                interval="1d", 
+                progress=False, 
+                group_by='ticker', 
+                auto_adjust=True,
+                threads=True, # Keep True for speed, but fallback could use False
+                timeout=20    # Increase default timeout if possible (yf param dependent)
+            )
+            return data
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt) # Exponential backoff: 1s, 2s, 4s...
+                continue
+            else:
+                raise e
+    return pd.DataFrame() # Should not be reached if raise e is there
 
 # -------------------------------------------------
 # Configuration
@@ -83,6 +134,26 @@ def calculate_obv(df):
                              np.where(df['Change'] < 0, -df['Volume'], 0))
     df['OBV'] = df['OBV_Vol'].cumsum().fillna(0)
     return df
+
+@st.cache_data(ttl=86400)
+def get_company_name(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get('shortName') or info.get('longName') or ""
+    except Exception:
+        return ""
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    gain = pd.Series(gain, index=series.index)
+    loss = pd.Series(loss, index=series.index)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def get_pivots(data, order=5):
     """Finds peaks and valleys using Scipy"""
@@ -179,17 +250,31 @@ def plot_static_matplotlib(df, divs, price_highs, price_lows, ticker):
 
 def plot_interactive_plotly(df, divs, ticker):
     """The 'Modern' Plotly Look"""
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                        subplot_titles=(f"{ticker} Price", "OBV"))
+    df = df.copy()
+    df['SMA20'] = df['Close'].rolling(20).mean()
+    df['SMA50'] = df['Close'].rolling(50).mean()
+    df['RSI'] = compute_rsi(df['Close'], period=14)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, row_heights=[0.6, 0.25, 0.15],
+                        subplot_titles=(f"{ticker} Price", "OBV", "RSI"))
 
     # Price Candle
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
                                  low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA20'], name='SMA20',
+                             line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA50'], name='SMA50',
+                             line=dict(color='orange')), row=1, col=1)
     
     # OBV Line
     fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], name='OBV', 
                              line=dict(color='purple')), row=2, col=1)
+
+    # RSI Line
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI',
+                             line=dict(color='teal')), row=3, col=1)
+    fig.add_hline(y=70, line=dict(color='red', dash='dot'), row=3, col=1)
+    fig.add_hline(y=30, line=dict(color='green', dash='dot'), row=3, col=1)
 
     # Divergence Lines
     for d in divs:
@@ -201,8 +286,8 @@ def plot_interactive_plotly(df, divs, ticker):
                                  mode='lines', line=dict(color=c, width=2, dash='dot'), 
                                  name=f"{d['Type']} OBV"), row=2, col=1)
 
-    fig.update_layout(xaxis_rangeslider_visible=False, height=600, showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(xaxis_rangeslider_visible=False, height=750, showlegend=False)
+    st.plotly_chart(fig, width="stretch")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -230,7 +315,7 @@ with st.sidebar:
 
     period = st.selectbox("Lookback Period", ["3mo", "6mo", "1y", "2y"], index=1)
     sensitivity = st.slider("Pivot Sensitivity", 3, 20, 5, help="Higher = Fewer, stronger pivots")
-    max_batch_size = st.slider("Download Batch Size", 20, 100, 50, help="Number of stocks to download in one go")
+    max_batch_size = st.slider("Download Batch Size", 10, 100, 30, help="Number of stocks to download in one go. Lower this if you see timeouts.")
 
 if st.button("🚀 Run Screener"):
     progress_bar = st.progress(0)
@@ -246,7 +331,7 @@ if st.button("🚀 Run Screener"):
         
         try:
             # Download entire batch at once
-            all_df = yf.download(batch, period=period, interval="1d", progress=False, group_by='ticker')
+            all_df = download_data_with_retry(batch, period=period)
             
             for ticker in batch:
                 try:
@@ -277,26 +362,58 @@ if st.button("🚀 Run Screener"):
 
     status_text.success(f"✅ Scanning Complete! Analyzed {len(results_container)} stocks. Found {len([r for r in results_container if r[2]])} stocks with signals.")
 
-    # Sort results to show signals first
     results_container.sort(key=lambda x: len(x[2]), reverse=True)
-
+    summary_rows = []
+    results_map = {}
     for ticker, df, divs, ph, pl in results_container:
-        if divs:
-            st.subheader(f"🎯 {ticker}: {divs[0]['Type']} Divergence Detected")
-            d = divs[0]
-            st.caption(f"Found between {d['P1_Date'].date()} and {d['P2_Date'].date()}")
-            
+        last_price = float(df['Close'].iloc[-1]) if not df.empty else np.nan
+        name = get_company_name(ticker)
+        has_signal = len(divs) > 0
+        sig_type = divs[0]['Type'] if has_signal else ""
+        from_date = divs[0]['P1_Date'].date() if has_signal else ""
+        to_date = divs[0]['P2_Date'].date() if has_signal else ""
+        summary_rows.append({
+            "Symbol": ticker,
+            "Name": name,
+            "Price": round(last_price, 2) if not np.isnan(last_price) else None,
+            "Signal": "Yes" if has_signal else "No",
+            "Type": sig_type,
+            "From": from_date,
+            "To": to_date
+        })
+        results_map[ticker] = (df, divs, ph, pl)
+    st.session_state.scan_results = summary_rows
+    st.session_state.results_map = results_map
+    st.session_state.selected_symbol = None
+
+if st.session_state.get("scan_results"):
+    st.subheader("Scan Results")
+    summary_rows = st.session_state.get("scan_results", [])
+    for r in summary_rows:
+        if isinstance(r.get("From"), (pd.Timestamp, np.datetime64)) or hasattr(r.get("From"), "strftime"):
+            r["From"] = str(r["From"])
+        if isinstance(r.get("To"), (pd.Timestamp, np.datetime64)) or hasattr(r.get("To"), "strftime"):
+            r["To"] = str(r["To"])
+        r["Name"] = str(r.get("Name") or "")
+        r["Signal"] = str(r.get("Signal") or "")
+        r["Type"] = str(r.get("Type") or "")
+    summary_df = pd.DataFrame(summary_rows)
+    if "Price" in summary_df.columns:
+        summary_df["Price"] = pd.to_numeric(summary_df["Price"], errors="coerce")
+    for col in ["Symbol", "Name", "Signal", "Type", "From", "To"]:
+        if col in summary_df.columns:
+            summary_df[col] = summary_df[col].fillna("").astype(str)
+    st.dataframe(summary_df, width="stretch")
+    st.subheader("Interactive Stock Viewer")
+    stock_options = [row["Symbol"] for row in summary_rows]
+    if stock_options:
+        selected_symbol = st.selectbox("Select a Stock", stock_options)
+        
+        results_map = st.session_state.get("results_map", {})
+        if selected_symbol in results_map:
+            df, divs, ph, pl = results_map[selected_symbol]
+            st.subheader(f"{selected_symbol} Chart")
             if chart_style == "Static (Matplotlib)":
-                plot_static_matplotlib(df, divs, ph, pl, ticker)
+                plot_static_matplotlib(df, divs, ph, pl, selected_symbol)
             else:
-                plot_interactive_plotly(df, divs, ticker)
-            st.divider()
-        else:
-            with st.expander(f"⚪ {ticker} (No Signal)"):
-                st.write("No clear divergence found.")
-                # Lazy loading: Only render chart if user checks this box
-                if st.checkbox(f"Show chart for {ticker}", key=f"show_{ticker}"):
-                    if chart_style == "Static (Matplotlib)":
-                        plot_static_matplotlib(df, [], ph, pl, ticker)
-                    else:
-                        plot_interactive_plotly(df, [], ticker)
+                plot_interactive_plotly(df, divs, selected_symbol)
