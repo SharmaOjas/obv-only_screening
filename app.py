@@ -16,6 +16,7 @@ import concurrent.futures
 import time
 import urllib3
 import warnings
+from groq import Groq
 
 # -------------------------------------------------
 # Network & Session Configuration
@@ -208,6 +209,48 @@ def detect_divergence(df, order=5):
     return results, price_highs_idx, price_lows_idx
 
 # -------------------------------------------------
+# 1.5. AI Summary Logic
+# -------------------------------------------------
+def get_ai_summary(api_key, results_data):
+    """
+    Generates a summary of the scan results using Groq API.
+    """
+    client = Groq(api_key=api_key)
+    
+    # Prepare data for the prompt
+    # We'll take the top 10 results to avoid token limits if list is huge
+    top_results = results_data[:15] 
+    
+    prompt_content = f"""
+    You are a financial analyst assistant. 
+    Here are the findings from an OBV Divergence Scan on Indian Stocks:
+    
+    {top_results}
+    
+    Please provide a concise but insightful summary of these findings.
+    Highlight the most significant Bullish and Bearish setups.
+    Explain what these divergences might indicate for the short-term trend of these specific stocks.
+    Format the output in clean Markdown.
+    """
+
+    completion = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt_content
+            }
+        ],
+        temperature=0.7,
+        max_tokens=1024,
+        top_p=1,
+        stream=False,
+        stop=None,
+    )
+
+    return completion.choices[0].message.content
+
+# -------------------------------------------------
 # 2. Visualization Options
 # -------------------------------------------------
 
@@ -316,6 +359,10 @@ with st.sidebar:
     period = st.selectbox("Lookback Period", ["3mo", "6mo", "1y", "2y"], index=1)
     sensitivity = st.slider("Pivot Sensitivity", 3, 20, 5, help="Higher = Fewer, stronger pivots")
     max_batch_size = st.slider("Download Batch Size", 10, 100, 30, help="Number of stocks to download in one go. Lower this if you see timeouts.")
+    
+    st.markdown("---")
+    st.subheader("🤖 AI Settings")
+    groq_api_key = st.text_input("Groq API Key", type="password", help="Enter your Groq API Key to enable AI summaries.")
 
 if st.button("🚀 Run Screener"):
     progress_bar = st.progress(0)
@@ -404,6 +451,23 @@ if st.session_state.get("scan_results"):
         if col in summary_df.columns:
             summary_df[col] = summary_df[col].fillna("").astype(str)
     st.dataframe(summary_df, width="stretch")
+
+    # --- AI Summary Section ---
+    if st.button("✨ Generate AI Summary"):
+        if not groq_api_key:
+            st.warning("⚠️ Please enter your Groq API Key in the sidebar settings first.")
+        elif not summary_rows:
+            st.warning("⚠️ No scan results to summarize. Please run the screener first.")
+        else:
+            with st.spinner("🤖 AI is analyzing market data..."):
+                try:
+                    # Pass the raw summary rows (list of dicts)
+                    ai_summary = get_ai_summary(groq_api_key, summary_rows)
+                    st.markdown("### 🤖 AI Market Analysis")
+                    st.markdown(ai_summary)
+                except Exception as e:
+                    st.error(f"❌ Error generating summary: {e}")
+    # --------------------------
     st.subheader("Interactive Stock Viewer")
     stock_options = [row["Symbol"] for row in summary_rows]
     if stock_options:
