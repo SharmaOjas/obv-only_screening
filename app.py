@@ -463,10 +463,11 @@ if st.session_state.get("scan_results"):
                 try:
                     # Pass the raw summary rows (list of dicts)
                     ai_summary = get_ai_summary(groq_api_key, summary_rows)
-                    st.markdown("### 🤖 AI Market Analysis")
+                    st.markdown("### AI Market Analysis")
                     st.markdown(ai_summary)
                 except Exception as e:
-                    st.error(f"❌ Error generating summary: {e}")
+                    # Avoid emoji in the error message string to prevent UnicodeEncodeError in some consoles
+                    st.error(f"Error generating summary: {e}")
     # --------------------------
     st.subheader("Interactive Stock Viewer")
     stock_options = [row["Symbol"] for row in summary_rows]
