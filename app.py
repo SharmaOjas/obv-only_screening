@@ -409,7 +409,9 @@ if st.button("🚀 Run Screener"):
 
     status_text.success(f"✅ Scanning Complete! Analyzed {len(results_container)} stocks. Found {len([r for r in results_container if r[2]])} stocks with signals.")
 
-    results_container.sort(key=lambda x: len(x[2]), reverse=True)
+    # Only keep results that have signals
+    results_container = [r for r in results_container if r[2]]
+    results_container.sort(key=lambda x: max([d['P2_Date'] for d in x[2]]), reverse=True)
     summary_rows = []
     results_map = {}
     for ticker, df, divs, ph, pl in results_container:
