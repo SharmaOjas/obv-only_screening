@@ -1,5 +1,4 @@
-streamlit
-yfinance
+upstox-python-sdk
 pandas
 numpy
 matplotlib
@@ -7,3 +6,4 @@ plotly
 scipy
 requests
 groq
+streamlit

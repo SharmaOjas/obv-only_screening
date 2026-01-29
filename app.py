@@ -1,5 +1,6 @@
 import streamlit as st
-import yfinance as yf
+import upstox_client
+from upstox_client.rest import ApiException
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,21 +9,81 @@ from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
 import requests
 from io import StringIO
-import requests
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
-from io import StringIO
 import concurrent.futures
 import time
 import urllib3
 import warnings
 from groq import Groq
+import datetime
+import gzip
+import io
 
 # -------------------------------------------------
 # Network & Session Configuration
 # -------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
+
+# -------------------------------------------------
+# Upstox Instrument Mapping
+# -------------------------------------------------
+@st.cache_data(ttl=86400)
+def get_upstox_instruments():
+    """
+    Downloads and caches the Upstox instrument master list.
+    """
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with gzip.open(io.BytesIO(response.content), 'rt') as f:
+                df = pd.read_csv(f)
+            # Filter for NSE and BSE equities, indices, and futures
+            df = df[df['exchange'].isin(['NSE_EQ', 'BSE_EQ', 'NSE_FO', 'NSE_INDEX'])]
+            return df
+    except Exception as e:
+        st.error(f"Error fetching instrument list: {e}")
+    return pd.DataFrame()
+
+def get_instrument_key(instruments_df, ticker, is_index=False):
+    """
+    Returns the instrument_key for a given ticker.
+    If is_index is True, it tries to find the current month FUTURE contract for volume.
+    """
+    if instruments_df.empty:
+        return None
+    
+    if is_index:
+        # Map Index Names to their derivative symbols in Upstox
+        index_map = {
+            "NIFTY 50": "NIFTY",
+            "NIFTY BANK": "BANKNIFTY",
+            "NIFTY FIN SERVICE": "FINNIFTY",
+            "NIFTY MIDCAP SELECT": "MIDCPNIFTY"
+        }
+        search_symbol = index_map.get(ticker, ticker)
+        
+        # Filter for NSE_FO and find the future with the nearest expiry
+        futures = instruments_df[
+            (instruments_df['exchange'] == 'NSE_FO') & 
+            (instruments_df['instrument_type'] == 'FUTIDX') &
+            (instruments_df['tradingsymbol'].str.startswith(search_symbol))
+        ].copy()
+        
+        if not futures.empty:
+            # Sort by expiry and take the nearest one (current month)
+            futures['expiry'] = pd.to_datetime(futures['expiry'])
+            futures = futures.sort_values('expiry')
+            return futures.iloc[0]['instrument_key']
+            
+    clean_ticker = ticker.split('.')[0].upper()
+    exchange = 'NSE_EQ' if ticker.endswith('.NS') else 'BSE_EQ' if ticker.endswith('.BO') else 'NSE_EQ'
+    
+    # Try exact match on tradingsymbol
+    match = instruments_df[(instruments_df['tradingsymbol'].str.upper() == clean_ticker) & (instruments_df['exchange'] == exchange)]
+    if not match.empty:
+        return match.iloc[0]['instrument_key']
+    
+    return None
 
 def get_session():
     """Creates a requests Session with robust retry logic."""
@@ -38,34 +99,47 @@ def get_session():
     session.mount("http://", adapter)
     return session
 
-def download_data_with_retry(tickers, period, retries=3):
+def fetch_upstox_historical_data(instrument_key, interval, from_date, to_date, access_token):
     """
-    Wraps yf.download with stronger retry logic for connection errors.
+    Fetches historical candle data from Upstox API v2.
     """
-    for attempt in range(retries):
-        try:
-            # yfinance doesn't natively accept a session for .download() in all versions,
-            # but we can try-except the call itself.
-            # Using threads=False to reduce rate-limit likelihood during retries if batching
-            data = yf.download(
-                tickers, 
-                period=period, 
-                interval="1d", 
-                progress=False, 
-                group_by='ticker', 
-                auto_adjust=True,
-                threads=True, # Keep True for speed, but fallback could use False
-                timeout=20    # Increase default timeout if possible (yf param dependent)
-            )
-            return data
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt) # Exponential backoff: 1s, 2s, 4s...
-                continue
-            else:
-                raise e
-    return pd.DataFrame() # Should not be reached if raise e is there
+    api_instance = upstox_client.HistoryApi()
+    api_instance.api_client.configuration.access_token = access_token
+    
+    try:
+        # api_response = api_instance.get_historical_candle_data_v3(instrument_key, interval, to_date, from_date)
+        # Note: Upstox API v2 Historical Candle Data
+        api_response = api_instance.get_historical_candle_data1(instrument_key, interval, to_date, from_date, "v2")
+        
+        if api_response.status == "success" and api_response.data.candles:
+            # Upstox candles are [timestamp, open, high, low, close, volume, open_interest]
+            candles = api_response.data.candles
+            df = pd.DataFrame(candles, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            df.set_index('Timestamp', inplace=True)
+            df.sort_index(inplace=True)
+            # Upstox returns data in descending order usually, or it depends. Sorting ensures consistency.
+            return df
+    except ApiException as e:
+        st.error(f"Upstox API Error for {instrument_key}: {e}")
+    except Exception as e:
+        st.error(f"General Error for {instrument_key}: {e}")
+    return pd.DataFrame()
 
+def map_period_to_dates(period):
+    """Maps yfinance-like periods to from_date and to_date for Upstox."""
+    to_date = datetime.date.today()
+    if period == "3mo":
+        from_date = to_date - datetime.timedelta(days=90)
+    elif period == "6mo":
+        from_date = to_date - datetime.timedelta(days=180)
+    elif period == "1y":
+        from_date = to_date - datetime.timedelta(days=365)
+    elif period == "2y":
+        from_date = to_date - datetime.timedelta(days=730)
+    else:
+        from_date = to_date - datetime.timedelta(days=180)
+    return from_date.strftime('%Y-%m-%d'), to_date.strftime('%Y-%m-%d')
 # -------------------------------------------------
 # Configuration
 # -------------------------------------------------
@@ -124,6 +198,10 @@ def fetch_all_bse_stocks():
         pass
     return ["500325", "532540", "500180"] # Very minimal fallback
 
+@st.cache_data(ttl=86400)
+def fetch_major_indices():
+    return ["NIFTY 50", "NIFTY BANK", "NIFTY FIN SERVICE", "NIFTY MIDCAP SELECT"]
+
 # -------------------------------------------------
 # 1. Logic & Math (The Improved "Synced" Engine)
 # -------------------------------------------------
@@ -137,13 +215,15 @@ def calculate_obv(df):
     return df
 
 @st.cache_data(ttl=86400)
-def get_company_name(ticker):
+def get_company_name(ticker, instruments_df):
     try:
-        info = yf.Ticker(ticker).info
-        return info.get('shortName') or info.get('longName') or ""
+        clean_ticker = ticker.split('.')[0]
+        match = instruments_df[instruments_df['tradingsymbol'] == clean_ticker]
+        if not match.empty:
+            return match.iloc[0]['name']
     except Exception:
-        return ""
-
+        pass
+    return ""
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0.0)
@@ -339,101 +419,104 @@ with st.sidebar:
     if st.checkbox("Use Preset List", value=True):
         dataset_choice = st.sidebar.selectbox(
             "Select Dataset", 
-            ["NIFTY 50", "NSE 500", "All NSE Stocks", "All BSE Stocks"], 
-            index=1
+            ["NIFTY 50", "NSE 500", "Major Indices", "All NSE Stocks", "All BSE Stocks"], 
+            index=2
         )
+        is_index_scan = dataset_choice == "Major Indices"
+        
         if dataset_choice == "NIFTY 50": symbols_raw = fetch_nifty50_stocks()
         elif dataset_choice == "NSE 500": symbols_raw = fetch_nse500_stocks()
+        elif dataset_choice == "Major Indices": symbols_raw = fetch_major_indices()
         elif dataset_choice == "All NSE Stocks": symbols_raw = fetch_all_nse_stocks()
         else: symbols_raw = fetch_all_bse_stocks()
         
-        suffix = ".BO" if dataset_choice == "All BSE Stocks" else ".NS"
+        suffix = "" if is_index_scan else (".BO" if dataset_choice == "All BSE Stocks" else ".NS")
         tickers = [f"{s}{suffix}" for s in symbols_raw]
         
-        num_to_scan = st.slider("Number of stocks to scan", 5, len(tickers), min(100, len(tickers)))
+        num_to_scan = st.slider("Number of stocks to scan", min(1, len(tickers)), len(tickers), min(100, len(tickers)))
         tickers = tickers[:num_to_scan]
     else:
         tickers_input = st.text_area("Stocks (comma sep)", "RELIANCE.NS, TCS.NS, HDFCBANK.NS, TATAMOTORS.NS, INFY.NS")
         tickers = [t.strip().upper() for t in tickers_input.split(',')]
 
     period = st.selectbox("Lookback Period", ["3mo", "6mo", "1y", "2y"], index=1)
+    timeframe = st.selectbox("Timeframe", ["Daily", "Weekly"], index=0)
     sensitivity = st.slider("Pivot Sensitivity", 3, 20, 5, help="Higher = Fewer, stronger pivots")
-    max_batch_size = st.slider("Download Batch Size", 10, 100, 30, help="Number of stocks to download in one go. Lower this if you see timeouts.")
+    
+    st.markdown("---")
+    st.subheader("🔑 Upstox API Settings")
+    upstox_access_token = st.text_input("Upstox Access Token", type="password", help="Enter your Upstox Access Token (valid for 1 day).")
     
     st.markdown("---")
     st.subheader("🤖 AI Settings")
     groq_api_key = st.text_input("Groq API Key", type="password", help="Enter your Groq API Key to enable AI summaries.")
 
 if st.button("🚀 Run Screener"):
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    results_container = []
-
-    # Batch Fetching Implementation
-    total_tickers = len(tickers)
-    for start_idx in range(0, total_tickers, max_batch_size):
-        batch = tickers[start_idx:start_idx + max_batch_size]
-        status_text.text(f"📥 Downloading batch {start_idx//max_batch_size + 1}: {len(batch)} tickers...")
+    if not upstox_access_token:
+        st.error("❌ Please enter an Upstox Access Token in the sidebar.")
+    else:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        try:
-            # Download entire batch at once
-            all_df = download_data_with_retry(batch, period=period)
-            
-            for ticker in batch:
-                try:
-                    # Handle single vs multi-ticker dataframes
-                    if len(batch) > 1:
-                        df = all_df[ticker]
-                    else:
-                        df = all_df
-                        
-                    if df.empty or 'Close' not in df.columns:
-                        continue
-                    
-                    # Clean data (handle MultiIndex if necessary, though group_by='ticker' usually handles it)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                        
-                    df = calculate_obv(df)
-                    divs, ph, pl = detect_divergence(df, order=sensitivity)
-                    results_container.append((ticker, df, divs, ph, pl))
-                except Exception as e:
-                    # Skip problematic stocks silently in batch
+        instruments_df = get_upstox_instruments()
+        from_date, to_date = map_period_to_dates(period)
+        
+        results_container = []
+        total_tickers = len(tickers)
+        
+        for idx, ticker in enumerate(tickers):
+            status_text.text(f"🔍 Analyzing {idx+1}/{total_tickers}: {ticker}")
+            try:
+                ikey = get_instrument_key(instruments_df, ticker, is_index=is_index_scan)
+                if not ikey:
+                    st.warning(f"Could not find instrument key for {ticker}")
+                    continue
+                
+                interval_map = {"Daily": "day", "Weekly": "week"}
+                selected_interval = interval_map.get(timeframe, "day")
+                
+                df = fetch_upstox_historical_data(ikey, selected_interval, from_date, to_date, upstox_access_token)
+                
+                if df.empty or 'Close' not in df.columns:
                     continue
                     
-        except Exception as e:
-            st.error(f"Error downloading batch: {e}")
-        
-        progress_bar.progress(min((start_idx + max_batch_size) / total_tickers, 1.0))
+                df = calculate_obv(df)
+                divs, ph, pl = detect_divergence(df, order=sensitivity)
+                results_container.append((ticker, df, divs, ph, pl))
+            except Exception as e:
+                # Silently skip errors for individual tickers
+                continue
+            
+            progress_bar.progress((idx + 1) / total_tickers)
 
-    status_text.success(f"✅ Scanning Complete! Analyzed {len(results_container)} stocks. Found {len([r for r in results_container if r[2]])} stocks with signals.")
+        status_text.success(f"✅ Scanning Complete! Analyzed {len(results_container)} stocks. Found {len([r for r in results_container if r[2]])} stocks with signals.")
 
-    # Only keep results that have signals
-    results_container = [r for r in results_container if r[2]]
-    results_container.sort(key=lambda x: max([d['P2_Date'] for d in x[2]]), reverse=True)
-    summary_rows = []
-    results_map = {}
-    for ticker, df, divs, ph, pl in results_container:
-        last_price = float(df['Close'].iloc[-1]) if not df.empty else np.nan
-        name = get_company_name(ticker)
-        has_signal = len(divs) > 0
-        sig_type = divs[0]['Type'] if has_signal else ""
-        from_date = divs[0]['P1_Date'].date() if has_signal else ""
-        to_date = divs[0]['P2_Date'].date() if has_signal else ""
-        summary_rows.append({
-            "Symbol": ticker,
-            "Name": name,
-            "Price": round(last_price, 2) if not np.isnan(last_price) else None,
-            "Signal": "Yes" if has_signal else "No",
-            "Type": sig_type,
-            "From": from_date,
-            "To": to_date
-        })
-        results_map[ticker] = (df, divs, ph, pl)
-    st.session_state.scan_results = summary_rows
-    st.session_state.results_map = results_map
-    st.session_state.selected_symbol = None
+        # Only keep results that have signals
+        results_container = [r for r in results_container if r[2]]
+        results_container.sort(key=lambda x: max([d['P2_Date'] for d in x[2]]), reverse=True)
+        summary_rows = []
+        results_map = {}
+        instruments_df = get_upstox_instruments()
+        for ticker, df, divs, ph, pl in results_container:
+            last_price = float(df['Close'].iloc[-1]) if not df.empty else np.nan
+            name = get_company_name(ticker, instruments_df)
+            has_signal = len(divs) > 0
+            sig_type = divs[0]['Type'] if has_signal else ""
+            from_date = divs[0]['P1_Date'].date() if has_signal else ""
+            to_date = divs[0]['P2_Date'].date() if has_signal else ""
+            summary_rows.append({
+                "Symbol": ticker,
+                "Name": name,
+                "Price": round(last_price, 2) if not np.isnan(last_price) else None,
+                "Signal": "Yes" if has_signal else "No",
+                "Type": sig_type,
+                "From": from_date,
+                "To": to_date
+            })
+            results_map[ticker] = (df, divs, ph, pl)
+        st.session_state.scan_results = summary_rows
+        st.session_state.results_map = results_map
+        st.session_state.selected_symbol = None
 
 if st.session_state.get("scan_results"):
     st.subheader("Scan Results")
