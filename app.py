@@ -202,6 +202,27 @@ def fetch_all_bse_stocks():
 def fetch_major_indices():
     return ["NIFTY 50", "NIFTY BANK", "NIFTY FIN SERVICE", "NIFTY MIDCAP SELECT"]
 
+@st.cache_data(ttl=86400)
+def fetch_nse_fno_stocks():
+    """
+    Filters the Upstox instrument list for stocks in the F&O segment.
+    """
+    df = get_upstox_instruments()
+    if df.empty:
+        return []
+    # Filter for NSE_FO exchange and FUTSTK (Future Stock)
+    # These represent the underlying stocks in F&O
+    fno_df = df[(df['exchange'] == 'NSE_FO') & (df['instrument_type'] == 'FUTSTK')]
+    
+    # Extract clean symbol (e.g., RELIANCE from RELIANCE24FEB)
+    # In Upstox, the 'tradingsymbol' for futures usually starts with the symbol
+    # but a better way is to use the 'symbol' or 'name' if available.
+    # However, let's look at common F&O stocks or filter by tradingsymbol prefix.
+    # Actually, Upstox CSV has a 'tradingsymbol' like 'RELIANCE25JANFUT'
+    # We can use a regex or just take the symbols.
+    symbols = fno_df['tradingsymbol'].str.replace(r'\d{2}[A-Z]{3}FUT$', '', regex=True).unique().tolist()
+    return sorted([s for s in symbols if s])
+
 # -------------------------------------------------
 # 1. Logic & Math (The Improved "Synced" Engine)
 # -------------------------------------------------
@@ -419,13 +440,14 @@ with st.sidebar:
     if st.checkbox("Use Preset List", value=True):
         dataset_choice = st.sidebar.selectbox(
             "Select Dataset", 
-            ["NIFTY 50", "NSE 500", "Major Indices", "All NSE Stocks", "All BSE Stocks"], 
+            ["NIFTY 50", "NSE 500", "NSE F&O", "Major Indices", "All NSE Stocks", "All BSE Stocks"], 
             index=2
         )
         is_index_scan = dataset_choice == "Major Indices"
         
         if dataset_choice == "NIFTY 50": symbols_raw = fetch_nifty50_stocks()
         elif dataset_choice == "NSE 500": symbols_raw = fetch_nse500_stocks()
+        elif dataset_choice == "NSE F&O": symbols_raw = fetch_nse_fno_stocks()
         elif dataset_choice == "Major Indices": symbols_raw = fetch_major_indices()
         elif dataset_choice == "All NSE Stocks": symbols_raw = fetch_all_nse_stocks()
         else: symbols_raw = fetch_all_bse_stocks()
